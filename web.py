@@ -1,22 +1,17 @@
+import ctypes
 import logging
-import os
-import socket
+import logging.handlers
+import json
 import sys
-import threading
-import time
-from typing import Optional, Tuple
-import select
+import asyncio
+import argparse
+import os
+import winreg
+from datetime import datetime, timezone
+from typing import Tuple, Optional
+
 if sys.platform == "win32":
     os.system("")
-HOST = '0.0.0.0'
-PORT = 8080
-BACKLOG = 100
-BUFFER_SIZE = 8192 * 4
-TIMEOUT = 10
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-
-logger = logging.getLogger(__name__)
 
 COLOR_REQUEST = "\033[92m"
 COLOR_ERROR = "\033[91m"
@@ -24,158 +19,247 @@ COLOR_CONNECT = "\033[94m"
 COLOR_RESET = "\033[0m"
 
 
-def print_log(color: str, msg: str, addr: Optional[Tuple] = None):
-    prefix = f"{addr[0]}:{addr[1]}" if addr else ""
-    logger.info(f"{prefix}{color}{msg}{COLOR_RESET}")
+class JsonFormatter(logging.Formatter):
+
+    def format(self, record):
+        if isinstance(record.msg, dict):
+            record.msg['timestamp'] = datetime.now(timezone.utc).isoformat()
+            return json.dumps(record.msg, ensure_ascii=False)
+        return super().format(record)
+
+
+class ProxyLogger:
+    def __init__(self, log_file: str, verbose: bool):
+        self.verbose = verbose
+
+        self.console_logger = logging.getLogger("ProxyConsole")
+        self.console_logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+        self.console_logger.propagate = False
+
+        if not self.console_logger.handlers:
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+            self.console_logger.addHandler(console_handler)
+
+        self.file_logger = logging.getLogger("ProxyConnections")
+        self.file_logger.setLevel(logging.INFO)
+        self.file_logger.propagate = False
+
+        if not self.file_logger.handlers:
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding='utf-8'
+            )
+            file_handler.setFormatter(JsonFormatter())
+            self.file_logger.addHandler(file_handler)
+
+    def log_connection(self, client_ip: str, method: str, host: str, port: int, status: str, error: str = ""):
+        self.error_ = {
+            "client_ip": client_ip,
+            "method": method,
+            "target_host": host,
+            "target_port": port,
+            "status": status,
+            "error": error
+        }
+        log_data = self.error_
+        self.file_logger.info(log_data)
+
+    def info(self, msg: str):
+        self.console_logger.info(msg)
+
+    def error(self, msg: str):
+        self.console_logger.error(f"{COLOR_ERROR}{msg}{COLOR_RESET}")
+
+    def print_request(self, color: str, msg: str, addr: Tuple[str, int]):
+        self.console_logger.info(f"{addr[0]}:{addr[1]} {color}{msg}{COLOR_RESET}")
 
 
 class ProxyServer:
-    def __init__(self, host: str = HOST, port: int = PORT):
+    def __init__(self, host: str, port: int, logger: ProxyLogger, timeout: int = 10):
         self.host = host
         self.port = port
-        self.running = True
-        self.server_socket: Optional[socket.socket] = None
+        self.logger = logger
+        self.timeout = timeout
+        self.server: Optional[asyncio.AbstractServer] = None
 
-    def start(self):
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(BACKLOG)
-        self.server_socket.settimeout(1)
+    async def start(self):
+        self.server = await asyncio.start_server(
+            self.handle_client, self.host, self.port
+        )
+        addrs = ', '.join(str(sock.getsockname()) for sock in self.server.sockets)
+        self.logger.info(f"Асинхронный прокси запущен на {addrs}")
 
-        logger.info(f"Прокси запущен на {self.host}:{self.port}")
+        async with self.server:
+            await self.server.serve_forever()
+
+    async def handle_client(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
+        client_addr = client_writer.get_extra_info('peername')
+        if not client_addr:
+            client_writer.close()
+            return
+
+        client_ip = client_addr[0]
+        method, target_host, target_port = "UNKNOWN", "UNKNOWN", 0
 
         try:
-            while self.running:
-                try:
-                    client_sock, client_addr = self.server_socket.accept()
-                    client_sock.settimeout(TIMEOUT)
-                    threading.Thread(target=self.handle_client,
-                                     args=(client_sock, client_addr,),
-                                     daemon=True).start()
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    if self.running:
-                        logger.error(f"Ошибка accept: {e}")
-        except KeyboardInterrupt:
-            logger.info("Остановка прокси...")
-        finally:
-            self.stop()
-
-    def stop(self):
-        self.running = False
-        if self.server_socket:
-            try:
-                self.server_socket.close()
-            except:
-                pass
-
-    def handle_client(self, client_sock: socket.socket, client_addr: Tuple):
-        try:
-            data = client_sock.recv(BUFFER_SIZE)
+            data = await asyncio.wait_for(client_reader.read(8192), timeout=self.timeout)
             if not data:
                 return
 
-            first_line = data.split(b'\n')[0].decode('utf-8', errors='ignore').strip()
-            method = first_line.split()[0] if first_line else ""
+            first_line = data.split(b'\r\n')[0].decode('utf-8', errors='ignore').strip()
+            if not first_line:
+                first_line = data.split(b'\n')[0].decode('utf-8', errors='ignore').strip()
 
-            print_log(COLOR_REQUEST, f"{first_line}", client_addr)
+            parts = first_line.split()
+            if len(parts) < 2:
+                raise ValueError("Неверный формат HTTP запроса")
+
+            method = parts[0]
+            target_host, target_port = self.parse_host_port(parts[1])
 
             if method == 'CONNECT':
-                self.handle_https_tunel(client_sock, first_line, client_addr)
+                self.logger.print_request(COLOR_CONNECT, first_line, client_addr)
+                await self.handle_https_tunnel(client_reader, client_writer, target_host, target_port)
             else:
-                self.handle_http(client_sock, data, first_line, client_addr)
+                self.logger.print_request(COLOR_REQUEST, first_line, client_addr)
+                await self.handle_http(client_reader, client_writer, data, target_host, target_port)
+
+            self.logger.log_connection(client_ip, method, target_host, target_port, "SUCCESS")
+
+        except asyncio.TimeoutError:
+            self.logger.error(f"[{client_ip}] Таймаут ожидания данных от клиента")
+            self.logger.log_connection(client_ip, method, target_host, target_port, "TIMEOUT")
         except Exception as e:
-            print_log(COLOR_ERROR, f"{e}", client_addr)
+            self.logger.error(f"[{client_ip}] Ошибка обработки клиента: {e}")
+            self.logger.log_connection(client_ip, method, target_host, target_port, "ERROR", str(e))
         finally:
-            client_sock.close()
+            if not client_writer.is_closing():
+                client_writer.close()
+                try:
+                    await client_writer.wait_closed()
+                except Exception:
+                    pass
 
-    def handle_http(self, client_sock: socket.socket, request: bytes, first_line: str, client_addr: Tuple):
-        try:
-            host, port = self.parse_host_port(first_line)
-            logger.debug(f"HTTP запрос к {host}:{port}")
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(TIMEOUT)
-                s.connect((host, port))
-                s.sendall(request)
-
-                self.relay_data(client_sock, s, is_https=False)
-
-        except Exception as e:
-            print_log(COLOR_ERROR, f"{e}", client_addr)
-
-    def handle_https_tunel(self, client_sock: socket.socket, connect_line: str, client_addr: Tuple):
-        try:
-            parts = connect_line.split()
-            host_port = parts[1]
-            if ':' in host_port:
-                host, host_port = host_port.split(':', 1)
-                port = int(host_port)
-            else:
-                host, port = host_port, 443
-
-            print_log(COLOR_CONNECT, f"CONNECT {host}:{port}", client_addr)
-
-            client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(TIMEOUT)
-                s.connect((host, port))
-                s.settimeout(None)
-                client_sock.settimeout(None)
-                self.relay_data(client_sock, s, is_https=True)
-        except Exception as e:
-            print_log(COLOR_ERROR, f"HTTPS туннель ошибка: {e}", client_addr)
-
-    def parse_host_port(self, first_line: str) -> Tuple[str, int]:
-        parts = first_line.split()
-        if len(parts) < 2:
-            raise ValueError("Неверный запрос")
-
-        url = parts[1]
+    def parse_host_port(self, url: str) -> Tuple[str, int]:
         if url.startswith("http://"):
             url = url[7:]
         elif url.startswith("https://"):
             url = url[8:]
 
-        if ':' in url and '/' in url.split(':', 1)[1]:
+        if ':' in url:
             host, rest = url.split(':', 1)
-            port = int(rest.split('/')[0])
-        elif ':' in url:
-            host, port_str = url.split(':', 1)
-            port = int(port_str.split('/')[0]) if '/' in port_str else int(port_str)
+            port_str = rest.split('/')[0]
+            port = int(port_str) if port_str.isdigit() else 80
         else:
             host = url.split('/')[0]
             port = 80
         return host, port
-    def relay_data(self, client_sock: socket.socket, s: socket.socket,is_https: bool=False):
-        sockets = [client_sock, s]
-        timeout = TIMEOUT *2
 
+    async def handle_http(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter,
+                          initial_data: bytes, host: str, port: int):
+        try:
+            remote_reader, remote_writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=self.timeout
+            )
+            remote_writer.write(initial_data)
+            await remote_writer.drain()
 
-        last_activity = time.time()
-        while time.time() - last_activity < timeout:
+            await self.relay_data(client_reader, client_writer, remote_reader, remote_writer)
+        except Exception as e:
+            raise ConnectionError(f"HTTP подключение к {host}:{port} провалилось: {e}")
+
+    async def handle_https_tunnel(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter,
+                                  host: str, port: int):
+        try:
+            remote_reader, remote_writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=self.timeout
+            )
+            client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await client_writer.drain()
+
+            await self.relay_data(client_reader, client_writer, remote_reader, remote_writer)
+        except Exception as e:
+            raise ConnectionError(f"HTTPS туннель к {host}:{port} провалился: {e}")
+
+    async def relay_data(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter,
+                         remote_reader: asyncio.StreamReader, remote_writer: asyncio.StreamWriter):
+
+        async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
             try:
-                readable, _, _ = select.select(sockets, [], [], 1.0)
-                for sock in readable:
-                    data = sock.recv(BUFFER_SIZE)
+                while True:
+                    data = await reader.read(8192 * 4)
                     if not data:
-                        return
-
-                    last_activity = time.time()
-
-                    other = s if sock is client_sock else client_sock
-                    other.sendall(data)
+                        break
+                    writer.write(data)
+                    await writer.drain()
             except Exception:
-                break
+                pass
+            finally:
+                if not writer.is_closing():
+                    writer.close()
+
+        task1 = asyncio.create_task(pipe(client_reader, remote_writer))
+        task2 = asyncio.create_task(pipe(remote_reader, client_writer))
+
+        await asyncio.gather(task1, task2, return_exceptions=True)
+
+
+class SystemProxyManager:
+    INTERNET_SETTINGS = r'Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+
+    @staticmethod
+    def set_state(enable: bool, host: str = "127.0.0.1", port: int = 8080):
+        if sys.platform != "win32":
+            print(f"[*] Авто-настройка пока реализована только для Windows. На {sys.platform} настройте вручную.")
+            return
+
+        try:
+            registry_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, SystemProxyManager.INTERNET_SETTINGS, 0,
+                                          winreg.KEY_WRITE)
+
+            if enable:
+                winreg.SetValueEx(registry_key, 'ProxyEnable', 0, winreg.REG_DWORD, 1)
+                winreg.SetValueEx(registry_key, 'ProxyServer', 0, winreg.REG_SZ, f"{host}:{port}")
+                winreg.SetValueEx(registry_key, 'ProxyOverride', 0, winreg.REG_SZ, "<local>")
+            else:
+                winreg.SetValueEx(registry_key, 'ProxyEnable', 0, winreg.REG_DWORD, 0)
+
+            winreg.CloseKey(registry_key)
+
+            ctypes.windll.Wininet.InternetSetOptionW(0, 39, 0, 0)
+            ctypes.windll.Wininet.InternetSetOptionW(0, 37, 0, 0)
+        except Exception as e:
+            print(f"[!] Ошибка при изменении настроек системы: {e}")
+
+async def main():
+    parser = argparse.ArgumentParser(description="Асинхронный прокси с авто-настройкой системы.")
+    parser.add_argument("-H", "--host", default="127.0.0.1")
+    parser.add_argument("-p", "--port", default=8080, type=int, help="Порт")
+    parser.add_argument("-l", "--log-file", default="proxy.jsonl")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--no-auto", action="store_true")
+
+    args = parser.parse_args()
+    logger = ProxyLogger(args.log_file, args.verbose)
+    proxy = ProxyServer(args.host, args.port, logger)
+
+    if not args.no_auto:
+        logger.info(f"Включаю системный прокси: {args.host}:{args.port}...")
+        SystemProxyManager.set_state(True, args.host, args.port)
+
+    try:
+        await proxy.start()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if not args.no_auto:
+            logger.info("Выключаю системный прокси и восстанавливаю настройки...")
+            SystemProxyManager.set_state(False)
+        logger.info("Прокси остановлен.")
+
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        try:
-            PORT = int(sys.argv[1])
-        except ValueError:
-            pass
-
-    proxy = ProxyServer(port=PORT)
-    proxy.start()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
